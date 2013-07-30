@@ -27,6 +27,8 @@ import suds
 from suds.sax import text
 
 from cinder import exception
+from cinder.image import image_utils
+from cinder.openstack.common import excutils
 from cinder.openstack.common import log as logging
 from cinder.volume.drivers.netapp.api import NaApiError
 from cinder.volume.drivers.netapp.api import NaElement
@@ -70,15 +72,27 @@ class NetAppNFSDriver(nfs.NfsDriver):
         vol_size = volume.size
         snap_size = snapshot.volume_size
 
-        if vol_size != snap_size:
-            msg = _('Cannot create volume of size %(vol_size)s from '
-                    'snapshot of size %(snap_size)s')
-            raise exception.CinderException(msg % locals())
-
         self._clone_volume(snapshot.name, volume.name, snapshot.volume_id)
         share = self._get_volume_location(snapshot.volume_id)
+        volume['provider_location'] = share
+        path = self.local_path(volume)
 
-        return {'provider_location': share}
+        if self._discover_file_till_timeout(path):
+            self._set_rw_permissions_for_all(path)
+            if vol_size != snap_size:
+                try:
+                    self._resize_volume(volume, vol_size)
+                except Exception as e:
+                    with excutils.save_and_reraise_exception():
+                        LOG.error(
+                            _("Resizing %s failed. Cleaning volume."),
+                            volume.name)
+                        self._execute('rm', path, run_as_root=True)
+        else:
+            raise exception.CinderException(
+                _("NFS file %s not discovered.") % volume['name'])
+
+        return {'provider_location': volume['provider_location']}
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
@@ -269,15 +283,26 @@ class NetAppNFSDriver(nfs.NfsDriver):
         vol_size = volume.size
         src_vol_size = src_vref.size
 
-        if vol_size != src_vol_size:
-            msg = _('Cannot create clone of size %(vol_size)s from '
-                    'volume of size %(src_vol_size)s')
-            raise exception.CinderException(msg % locals())
-
         self._clone_volume(src_vref.name, volume.name, src_vref.id)
         share = self._get_volume_location(src_vref.id)
+        volume['provider_location'] = share
+        path = self.local_path(volume)
 
-        return {'provider_location': share}
+        if self._discover_file_till_timeout(path):
+            self._set_rw_permissions_for_all(path)
+            if vol_size != src_vol_size:
+                try:
+                    self._resize_volume(volume, vol_size)
+                except Exception as e:
+                    LOG.error(
+                        _("Resizing %s failed. Cleaning volume."), volume.name)
+                    self._execute('rm', path, run_as_root=True)
+                    raise e
+        else:
+            raise exception.CinderException(
+                _("NFS file %s not discovered.") % volume['name'])
+
+        return {'provider_location': volume['provider_location']}
 
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
@@ -288,6 +313,53 @@ class NetAppNFSDriver(nfs.NfsDriver):
                                               'NetApp_NFS_7mode')
         self._stats["vendor_name"] = 'NetApp'
         self._stats["driver_version"] = '1.0'
+
+    def _resize_volume(self, volume, new_size):
+        """Extend an existing volume to the new size."""
+        LOG.info(_('Extending volume %s.'), volume['name'])
+        path = self.local_path(volume)
+        self._resize_image_file(path, new_size)
+
+    def _resize_image_file(self, path, new_size):
+        """Resize the image file on share to new size."""
+        LOG.debug(_('Checking file for resize'))
+        if self._is_file_size_equal(path, new_size):
+            return
+        else:
+            LOG.info(_('Resizing file to %sG'), new_size)
+            image_utils.resize_image(path, new_size)
+            if self._is_file_size_equal(path, new_size):
+                return
+            else:
+                raise exception.InvalidResults(
+                    _('Resizing image file failed.'))
+
+    def _is_file_size_equal(self, path, size):
+        """Checks if file size at path is equal to size."""
+        data = image_utils.qemu_img_info(path)
+        GiB = 1024 * 1024 * 1024
+        virt_size = data.virtual_size / GiB
+        if virt_size == size:
+            return True
+        else:
+            return False
+
+    def _discover_file_till_timeout(self, path, timeout=45):
+        """Checks if file size at path is equal to size."""
+        # Sometimes nfs takes time to discover file
+        # Retrying in case any unexpected situation occurs
+        retry_seconds = timeout
+        sleep_interval = 2
+        while True:
+            if os.path.exists(path):
+                return True
+            else:
+                if retry_seconds <= 0:
+                    LOG.warn(_('Discover file retries exhausted.'))
+                    return False
+                else:
+                    time.sleep(sleep_interval)
+                    retry_seconds = retry_seconds - sleep_interval
 
 
 class NetAppCmodeNfsDriver (NetAppNFSDriver):
