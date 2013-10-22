@@ -22,6 +22,8 @@ import copy
 import os
 import re
 import socket
+import suds
+from suds.sax import text
 from threading import Timer
 import time
 import urlparse
@@ -38,6 +40,7 @@ from cinder import utils
 from cinder.volume.drivers.netapp.api import NaApiError
 from cinder.volume.drivers.netapp.api import NaElement
 from cinder.volume.drivers.netapp.api import NaServer
+from cinder.volume.drivers.netapp.iscsi import netapp_opts
 from cinder.volume.drivers.netapp.options import netapp_basicauth_opts
 from cinder.volume.drivers.netapp.options import netapp_cluster_opts
 from cinder.volume.drivers.netapp.options import netapp_connection_opts
@@ -53,8 +56,15 @@ from cinder.volume.drivers import nfs
 
 LOG = logging.getLogger(__name__)
 
+netapp_nfs_opts = [
+    cfg.IntOpt('synchronous_snapshot_create',
+               default=0,
+               help='Does snapshot creation call returns immediately')]
+
 
 CONF = cfg.CONF
+CONF.register_opts(netapp_opts)
+CONF.register_opts(netapp_nfs_opts)
 CONF.register_opts(netapp_connection_opts)
 CONF.register_opts(netapp_transport_opts)
 CONF.register_opts(netapp_basicauth_opts)
@@ -78,16 +88,20 @@ class NetAppNFSDriver(nfs.NfsDriver):
         self.configuration.append_config_values(netapp_basicauth_opts)
         self.configuration.append_config_values(netapp_transport_opts)
         self.configuration.append_config_values(netapp_img_cache_opts)
+        self.configuration.append_config_values(netapp_opts)
+        self.configuration.append_config_values(netapp_nfs_opts)
 
     def set_execute(self, execute):
         self._execute = execute
 
     def do_setup(self, context):
         super(NetAppNFSDriver, self).do_setup(context)
+        self._client = self._get_client()
 
     def check_for_setup_error(self):
-        """Returns an error if prerequisites aren't met."""
-        raise NotImplementedError()
+        """Returns an error if prerequisites aren't met"""
+        self._check_dfm_flags()
+        super(NetAppNFSDriver, self).check_for_setup_error()
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
@@ -132,9 +146,29 @@ class NetAppNFSDriver(nfs.NfsDriver):
         self._execute('rm', self._get_volume_path(nfs_mount, snapshot.name),
                       run_as_root=True)
 
+    def _check_dfm_flags(self):
+        """Raises error if any required configuration flag for OnCommand proxy
+        is missing."""
+        required_flags = ['netapp_wsdl_url',
+                          'netapp_login',
+                          'netapp_password',
+                          'netapp_server_hostname',
+                          'netapp_server_port']
+        for flag in required_flags:
+            if not getattr(self.configuration, flag, None):
+                raise exception.CinderException(_('%s is not set') % flag)
+
     def _get_client(self):
-        """Creates client for server."""
-        raise NotImplementedError()
+        """Creates SOAP _client for ONTAP-7 DataFabric Service."""
+        client = suds.client.Client(
+            self.configuration.netapp_wsdl_url,
+            username=self.configuration.netapp_login,
+            password=self.configuration.netapp_password)
+        soap_url = 'http://%s:%s/apis/soap/v1' % (
+            self.configuration.netapp_server_hostname,
+            self.configuration.netapp_server_port)
+        client.set_options(location=soap_url)
+        return client
 
     def _get_volume_location(self, volume_id):
         """Returns NFS mount address as <nfs_ip_address>:<nfs_mount_dir>."""
@@ -143,8 +177,56 @@ class NetAppNFSDriver(nfs.NfsDriver):
         return (nfs_server_ip + ':' + export_path)
 
     def _clone_volume(self, volume_name, clone_name, volume_id, share=None):
-        """Clones mounted volume using NetApp api."""
-        raise NotImplementedError()
+        """Clones mounted volume with OnCommand proxy API"""
+        host_id = self._get_host_id(volume_id)
+        export_path = self._get_full_export_path(volume_id, host_id)
+
+        request = self._client.factory.create('Request')
+        request.Name = 'clone-start'
+
+        clone_start_args = ('<source-path>%s/%s</source-path>'
+                            '<destination-path>%s/%s</destination-path>')
+
+        request.Args = text.Raw(clone_start_args % (export_path,
+                                                    volume_name,
+                                                    export_path,
+                                                    clone_name))
+
+        resp = self._client.service.ApiProxy(Target=host_id,
+                                             Request=request)
+
+        if (resp.Status == 'passed' and
+                self.configuration.synchronous_snapshot_create):
+            clone_id = resp.Results['clone-id'][0]
+            clone_id_info = clone_id['clone-id-info'][0]
+            clone_operation_id = int(clone_id_info['clone-op-id'][0])
+
+            self._wait_for_clone_finished(clone_operation_id, host_id)
+        elif resp.Status == 'failed':
+            raise exception.CinderException(resp.Reason)
+
+    def _wait_for_clone_finished(self, clone_operation_id, host_id):
+        """
+        Polls ONTAP7 for clone status. Returns once clone is finished.
+        :param clone_operation_id: Identifier of ONTAP clone operation
+        """
+        clone_list_options = ('<clone-id>'
+                              '<clone-id-info>'
+                              '<clone-op-id>%d</clone-op-id>'
+                              '<volume-uuid></volume-uuid>'
+                              '</clone-id>'
+                              '</clone-id-info>')
+
+        request = self._client.factory.create('Request')
+        request.Name = 'clone-list-status'
+        request.Args = text.Raw(clone_list_options % clone_operation_id)
+
+        resp = self._client.service.ApiProxy(Target=host_id, Request=request)
+
+        while resp.Status != 'passed':
+            time.sleep(1)
+            resp = self._client.service.ApiProxy(Target=host_id,
+                                                 Request=request)
 
     def _get_provider_location(self, volume_id):
         """Returns provider location for given volume."""
@@ -158,6 +240,38 @@ class NetAppNFSDriver(nfs.NfsDriver):
     def _get_export_path(self, volume_id):
         """Returns NFS export path for the given volume."""
         return self._get_provider_location(volume_id).split(':')[1]
+
+    def _get_host_id(self, volume_id):
+        """Returns ID of the ONTAP-7 host"""
+        host_ip = self._get_host_ip(volume_id)
+        server = self._client.service
+
+        resp = server.HostListInfoIterStart(ObjectNameOrId=host_ip)
+        tag = resp.Tag
+
+        try:
+            res = server.HostListInfoIterNext(Tag=tag, Maximum=1)
+            if hasattr(res, 'Hosts') and res.Hosts.HostInfo:
+                return res.Hosts.HostInfo[0].HostId
+        finally:
+            server.HostListInfoIterEnd(Tag=tag)
+
+    def _get_full_export_path(self, volume_id, host_id):
+        """Returns full path to the NFS share, e.g. /vol/vol0/home"""
+        export_path = self._get_export_path(volume_id)
+        command_args = '<pathname>%s</pathname>'
+
+        request = self._client.factory.create('Request')
+        request.Name = 'nfs-exportfs-storage-path'
+        request.Args = text.Raw(command_args % export_path)
+
+        resp = self._client.service.ApiProxy(Target=host_id,
+                                             Request=request)
+
+        if resp.Status == 'passed':
+            return resp.Results['actual-pathname'][0]
+        elif resp.Status == 'failed':
+            raise exception.CinderException(resp.Reason)
 
     def _volume_not_present(self, nfs_mount, volume_name):
         """Check if volume exists."""
@@ -226,17 +340,29 @@ class NetAppNFSDriver(nfs.NfsDriver):
     def _update_volume_stats(self):
         """Retrieve stats info from volume group."""
         super(NetAppNFSDriver, self)._update_volume_stats()
-        self._spawn_clean_cache_job()
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_7mode')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'
+        try:
+            self._spawn_clean_cache_job()
+        except exception.CinderException:
+            pass
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
         """Fetch the image from image_service and write it to the volume."""
         super(NetAppNFSDriver, self).copy_image_to_volume(
             context, volume, image_service, image_id)
         LOG.info(_('Copied image to volume %s'), volume['name'])
-        self._register_image_in_cache(volume, image_id)
+        try:
+            self._register_image_in_cache(volume, image_id)
+        except exception.CinderException:
+            pass
 
     def _register_image_in_cache(self, volume, image_id):
         """Stores image in the cache."""
+        self._is_image_clone_supported()
         file_name = 'img-cache-%s' % image_id
         LOG.info(_("Registering image in cache %s"), file_name)
         try:
@@ -278,6 +404,7 @@ class NetAppNFSDriver(nfs.NfsDriver):
     @utils.synchronized('clean_cache')
     def _spawn_clean_cache_job(self):
         """Spawns a clean task if not running."""
+        self._is_image_clone_supported()
         if getattr(self, 'cleaning', None):
                 LOG.debug(_('Image cache cleaning in progress. Returning... '))
                 return
@@ -389,6 +516,7 @@ class NetAppNFSDriver(nfs.NfsDriver):
         boolean indicating whether cloning occurred.
         """
 
+        self._is_image_clone_supported()
         cloned = False
         post_clone = False
         share = None
@@ -415,6 +543,10 @@ class NetAppNFSDriver(nfs.NfsDriver):
             share = volume['provider_location'] if cloned else None
             bootable = True if cloned else False
             return {'provider_location': share, 'bootable': bootable}, cloned
+
+    def _is_image_clone_supported(self):
+        """Checks whether image clone is supported."""
+        raise exception.CinderException(_('Image cloning not supported.'))
 
     def _clone_from_cache(self, volume, image_id, cache_result):
         """Clones a copy from image cache."""
@@ -616,6 +748,61 @@ class NetAppNFSDriver(nfs.NfsDriver):
         raise NotImplementedError()
 
 
+class NetAppCmodeNfsDriver (NetAppNFSDriver):
+    """Executes commands related to volumes on c mode"""
+    def __init__(self, *args, **kwargs):
+        super(NetAppCmodeNfsDriver, self).__init__(*args, **kwargs)
+
+    def do_setup(self, context):
+        self._context = context
+        self.check_for_setup_error()
+        self._client = self._get_client()
+
+    def check_for_setup_error(self):
+        """Returns an error if prerequisites aren't met"""
+        self._check_flags()
+
+    def _clone_volume(self, volume_name, clone_name, volume_id, share=None):
+        """Clones mounted volume with NetApp Cloud Services"""
+        host_ip = self._get_host_ip(volume_id)
+        export_path = self._get_export_path(volume_id)
+        LOG.debug(_("""Cloning with params ip %(host_ip)s, exp_path
+                    %(export_path)s, vol %(volume_name)s,
+                    clone_name %(clone_name)s""") % locals())
+        self._client.service.CloneNasFile(host_ip, export_path,
+                                          volume_name, clone_name)
+
+    def _check_flags(self):
+        """Raises error if any required configuration flag for NetApp Cloud
+        Webservices is missing."""
+        required_flags = ['netapp_wsdl_url',
+                          'netapp_login',
+                          'netapp_password',
+                          'netapp_server_hostname',
+                          'netapp_server_port']
+        for flag in required_flags:
+            if not getattr(self.configuration, flag, None):
+                raise exception.CinderException(_('%s is not set') % flag)
+
+    def _get_client(self):
+        """Creates SOAP _client for NetApp Cloud service."""
+        client = suds.client.Client(
+            self.configuration.netapp_wsdl_url,
+            username=self.configuration.netapp_login,
+            password=self.configuration.netapp_password)
+        return client
+
+    def _update_volume_status(self):
+        """Retrieve status info from volume group."""
+        super(NetAppCmodeNfsDriver, self)._update_volume_status()
+
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_Cluster')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'
+
+
 class NetAppDirectNfsDriver (NetAppNFSDriver):
     """Executes commands related to volumes on NetApp filer."""
 
@@ -692,6 +879,10 @@ class NetAppDirectNfsDriver (NetAppNFSDriver):
         file_use = NaElement.create_node_with_children(
             'file-usage-get', **{'path': path})
         return file_use
+
+    def _is_image_clone_supported(self):
+        """Checks whether image clone is supported."""
+        pass
 
 
 class NetAppDirectCmodeNfsDriver (NetAppDirectNfsDriver):
