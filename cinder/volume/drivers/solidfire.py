@@ -298,7 +298,7 @@ class SolidFire(SanISCSIDriver):
         if not found_volume:
             LOG.error(_('Failed to retrieve volume SolidFire-'
                         'ID: %s in get_by_account!') % sf_volume_id)
-            raise exception.VolumeNotFound(volume_id=uuid)
+            raise exception.VolumeNotFound(volume_id=sf_volume_id)
 
         model_update = {}
         # NOTE(john-griffith): SF volumes are always at lun 0
@@ -327,14 +327,19 @@ class SolidFire(SanISCSIDriver):
 
         sf_vol = self._get_sf_volume(src_uuid, params)
         if sf_vol is None:
-            raise exception.VolumeNotFound(volume_id=uuid)
+            raise exception.VolumeNotFound(volume_id=src_uuid)
 
         if src_project_id != v_ref['project_id']:
             sfaccount = self._create_sfaccount(v_ref['project_id'])
 
+        if v_ref.get('size', None):
+            new_size = v_ref['size']
+        else:
+            new_size = v_ref['volume_size']
+
         params = {'volumeID': int(sf_vol['volumeID']),
                   'name': 'UUID-%s' % v_ref['id'],
-                  'newSize': int(v_ref['size'] * self.GB),
+                  'newSize': int(new_size * self.GB),
                   'newAccountID': sfaccount['accountID']}
         data = self._issue_api_request('CloneVolume', params)
 
@@ -539,7 +544,10 @@ class SolidFire(SanISCSIDriver):
     def ensure_export(self, context, volume):
         """Verify the iscsi export info."""
         LOG.debug(_("Executing SolidFire ensure_export..."))
-        return self._do_export(volume)
+        try:
+            return self._do_export(volume)
+        except exception.SolidFireAPIException:
+            return None
 
     def create_export(self, context, volume):
         """Setup the iscsi export info."""
