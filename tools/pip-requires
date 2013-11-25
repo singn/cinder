@@ -6,6 +6,7 @@ eventlet>=0.9.17
 kombu>=1.0.4
 lockfile>=0.8
 lxml>=2.3
+requests>=1.1
 routes>=1.12.3
 WebOb==1.2.3
 wsgiref>=0.1.2

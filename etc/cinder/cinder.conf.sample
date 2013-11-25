@@ -785,22 +785,22 @@
 
 
 #
-# Options defined in cinder.volume.drivers.netapp
+# Options defined in cinder.volume.drivers.netapp.iscsi
 #
 
-# URL of the WSDL file for the DFM server (string value)
+# URL of the WSDL file for the DFM/Webservice server (string value)
 #netapp_wsdl_url=<None>
 
-# User name for the DFM server (string value)
+# User name for the DFM/Controller server (string value)
 #netapp_login=<None>
 
-# Password for the DFM server (string value)
+# Password for the DFM/Controller server (string value)
 #netapp_password=<None>
 
-# Hostname for the DFM server (string value)
+# Hostname for the DFM/Controller server (string value)
 #netapp_server_hostname=<None>
 
-# Port number for the DFM server (integer value)
+# Port number for the DFM/Controller server (integer value)
 #netapp_server_port=8088
 
 # Storage service to use for provisioning (when
@@ -811,43 +811,93 @@
 # (volume_type name will be appended) (string value)
 #netapp_storage_service_prefix=<None>
 
+# Cluster vserver to use for provisioning (string value)
+#netapp_vserver=openstack
+
 # Vfiler to use for provisioning (string value)
 #netapp_vfiler=<None>
 
+# Transport type protocol (string value)
+#netapp_transport_type=http
+
+# Volume size multiplier to ensure while creation (float value)
+#netapp_size_multiplier=1.2
+
+# Comma separated eligible volumes for provisioning on (string value)
+#netapp_volume_list=<None>
+
 
 #
-# Options defined in cinder.volume.drivers.netapp_nfs
+# Options defined in cinder.volume.drivers.netapp.nfs
 #
 
 # Does snapshot creation call returns immediately (integer
 # value)
 #synchronous_snapshot_create=0
 
-# URL of the WSDL file for the DFM server (string value)
+# URL of the WSDL file for the DFM/Webservice server (string value)
 #netapp_wsdl_url=<None>
 
-# User name for the DFM server (string value)
+# User name for the DFM/Controller server (string value)
 #netapp_login=<None>
 
-# Password for the DFM server (string value)
+# Password for the DFM/Controller server (string value)
 #netapp_password=<None>
 
-# Hostname for the DFM server (string value)
+# Hostname for the DFM/Controller server (string value)
 #netapp_server_hostname=<None>
 
-# Port number for the DFM server (integer value)
+# Port number for the DFM/Controller server (integer value)
 #netapp_server_port=8088
 
-# Storage service to use for provisioning (when
-# volume_type=None) (string value)
-#netapp_storage_service=<None>
+# Transport type protocol (string value)
+#netapp_transport_type=http
 
-# Prefix of storage service name to use for provisioning
-# (volume_type name will be appended) (string value)
-#netapp_storage_service_prefix=<None>
 
-# Vfiler to use for provisioning (string value)
-#netapp_vfiler=<None>
+#
+# Options defined in cinder.volume.drivers.netapp.eseries.iscsi
+#
+
+# User name for the proxy server. (string value)
+#netapp_login=<None>
+
+# Password for the proxy server. (string value)
+#netapp_password=<None>
+
+# Host name for the proxy server. (string value)
+#netapp_server_hostname=<None>
+
+# Port number for the proxy server. (int value)
+#netapp_server_port=80
+
+# Transport type protocol. (string value)
+#netapp_transport_type=http
+
+# This option is used to specify the path to the E-Series
+# proxy application on a proxy server. The value is
+# combined with the value of the netapp_transport_type,
+# netapp_server_hostname, and netapp_server_port options
+# to create the URL used by the driver to connect to the
+# proxy application. (string value)
+#netapp_webservice_path=/devmgr/v2
+
+# This option is only utilized when the storage family
+# is configured to eseries. This option is used to
+# restrict provisioning to the specified controllers.
+# Specify the value of this option to be a comma
+# separated list of controller hostnames or IP addresses
+# to be used for provisioning. (string value)
+#netapp_controller_ips=<None>
+
+# Password for the NetApp E-Series storage array. (string value)
+#netapp_sa_password=<None>
+
+# This option is used to restrict provisioning to the
+# specified storage pools. Only dynamic disk pools are
+# currently supported. Specify the value of this option to
+# be a comma separated list of disk pool names to be used
+# for provisioning. (string value)
+#netapp_storage_pools=<None>
 
 
 #

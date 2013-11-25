@@ -134,6 +134,9 @@ class CinderException(Exception):
         super(CinderException, self).__init__(message)
 
 
+class VolumeDriverException(CinderException):
+    message = _("Volume driver reported an error: %(message)s")
+
 class GlanceConnectionFailed(CinderException):
     message = _("Connection to glance failed") + ": %(reason)s"
 
@@ -579,3 +582,7 @@ class InvalidBackup(Invalid):
 
 class SwiftConnectionFailed(CinderException):
     message = _("Connection to swift failed") + ": %(reason)s"
+
+
+class NetAppDriverException(VolumeDriverException):
+    message = _("NetApp Cinder Driver exception.")
