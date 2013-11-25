@@ -22,8 +22,11 @@ This module contains common utilities to be used by one or more
 NetApp drivers to achieve the desired functionality.
 """
 
+import base64
+import binascii
 import copy
 import socket
+import uuid
 
 from cinder import context
 from cinder import exception
@@ -249,3 +252,34 @@ def get_volume_extra_specs(volume):
         volume_type = volume_types.get_volume_type(ctxt, type_id)
         specs = volume_type.get('extra_specs')
     return specs
+
+
+def resolve_hostname(hostname):
+    """Resolves host name to IP address."""
+    res = socket.getaddrinfo(hostname, None)[0]
+    family, socktype, proto, canonname, sockaddr = res
+    return sockaddr[0]
+
+
+def encode_hex_to_base32(hex_string):
+    """Encodes hex to base32 bit as per RFC4648."""
+    bin_form = binascii.unhexlify(hex_string)
+    return base64.b32encode(bin_form)
+
+
+def decode_base32_to_hex(base32_string):
+    """Decodes base32 string to hex string."""
+    bin_form = base64.b32decode(base32_string)
+    return binascii.hexlify(bin_form)
+
+
+def convert_uuid_to_es_fmt(uuid_str):
+    """Converts uuid to e-series compatible name format."""
+    uuid_base32 = encode_hex_to_base32(uuid.UUID(str(uuid_str)).hex)
+    return uuid_base32.strip('=')
+
+
+def convert_es_fmt_to_uuid(es_label):
+    """Converts e-series name format to uuid."""
+    es_label_b32 = es_label.ljust(32, '=')
+    return uuid.UUID(binascii.hexlify(base64.b32decode(es_label_b32)))

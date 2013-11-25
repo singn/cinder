@@ -105,6 +105,9 @@ class CinderException(Exception):
         return unicode(self.msg)
 
 
+class VolumeDriverException(CinderException):
+    message = _("Volume driver reported an error: %(message)s")
+
 class GlanceConnectionFailed(CinderException):
     message = _("Connection to glance failed: %(reason)s")
 
@@ -641,3 +644,6 @@ class QoSSpecsInUse(CinderException):
 
 class KeyManagerError(CinderException):
     msg_fmt = _("key manager error: %(reason)s")
+
+class NetAppDriverException(VolumeDriverException):
+    message = _("NetApp Cinder Driver exception.")
