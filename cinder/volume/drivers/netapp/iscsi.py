@@ -2011,7 +2011,8 @@ class NetAppDirectISCSIDriver(driver.ISCSIDriver):
         if curr_size_bytes != new_size_bytes:
             lun_geometry = self._get_lun_geometry(path)
             if (lun_geometry and lun_geometry.get("max_resize")
-                    and lun_geometry.get("max_resize") >= new_size_bytes):
+                    and int(lun_geometry.get("max_resize")) >=
+                    int(new_size_bytes)):
                 self._do_direct_resize(path, new_size_bytes)
             else:
                 self._do_sub_clone_resize(path, new_size_bytes)
@@ -2189,7 +2190,6 @@ class NetAppDirectCmodeISCSIDriver(NetAppDirectISCSIDriver):
         self.client.set_api_version(major, minor)
         self.ssc_vols = None
         self.stale_vols = set()
-        ssc_utils.refresh_cluster_ssc(self, self.client, self.vserver)
 
     def _create_lun_on_eligible_vol(self, name, size, metadata,
                                     extra_specs=None):
@@ -2465,6 +2465,9 @@ class NetAppDirectCmodeISCSIDriver(NetAppDirectISCSIDriver):
 
     def _update_cluster_vol_stats(self, data):
         """Updates vol stats with cluster config."""
+        sync = True if self.ssc_vols is None else False
+        ssc_utils.refresh_cluster_ssc(self, self.client, self.vserver,
+                                      synchronous=sync)
         if self.ssc_vols:
             data['netapp_mirrored'] = 'true'\
                 if self.ssc_vols['mirrored'] else 'false'
@@ -2498,7 +2501,6 @@ class NetAppDirectCmodeISCSIDriver(NetAppDirectISCSIDriver):
                 data['free_capacity_gb'] = 0
         else:
             LOG.warn(_("Cluster ssc is not updated. No volume stats found."))
-        ssc_utils.refresh_cluster_ssc(self, self.client, self.vserver)
 
     @utils.synchronized('update_stale')
     def _update_stale_vols(self, volume=None, reset=False):

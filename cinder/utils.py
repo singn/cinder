@@ -22,7 +22,6 @@
 
 import contextlib
 import datetime
-import functools
 import hashlib
 import inspect
 import os
@@ -30,6 +29,7 @@ import pyclbr
 import random
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -794,7 +794,8 @@ def brick_get_connector_properties():
 def brick_get_connector(protocol, driver=None,
                         execute=processutils.execute,
                         use_multipath=False,
-                        device_scan_attempts=3):
+                        device_scan_attempts=3,
+                        *args, **kwargs):
     """Wrapper to get a brick connector object.
     This automatically populates the required protocol as well
     as the root_helper needed to execute commands.
@@ -806,15 +807,30 @@ def brick_get_connector(protocol, driver=None,
                                                 execute=execute,
                                                 use_multipath=use_multipath,
                                                 device_scan_attempts=
-                                                device_scan_attempts)
+                                                device_scan_attempts,
+                                                *args, **kwargs)
 
 
-def require_driver_initialized(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        # we can't do anything if the driver didn't init
-        if not self.driver.initialized:
-            driver_name = self.driver.__class__.__name__
-            raise exception.DriverNotInitialized(driver=driver_name)
-        return func(self, *args, **kwargs)
-    return wrapper
+def get_file_mode(path):
+    """This primarily exists to make unit testing easier."""
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def get_file_gid(path):
+    """This primarily exists to make unit testing easier."""
+    return os.stat(path).st_gid
+
+
+def require_driver_initialized(driver):
+    """Verifies if `driver` is initialized
+
+    If the driver is not initialized, an exception will be raised.
+
+    :params driver: The driver instance.
+    :raises: `exception.DriverNotInitialized`
+    """
+    # we can't do anything if the driver didn't init
+    if not driver.initialized:
+        driver_name = driver.__class__.__name__
+        LOG.error(_("Volume driver %s not initialized") % driver_name)
+        raise exception.DriverNotInitialized()
