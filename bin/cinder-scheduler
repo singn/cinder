@@ -54,6 +54,6 @@ if __name__ == '__main__':
          version=version.version_string())
     logging.setup("cinder")
     utils.monkey_patch()
-    server = service.Service.create(binary='cinder-scheduler')
+    server = service.ServiceFactory.create(binary='cinder-scheduler')
     service.serve(server)
     service.wait()

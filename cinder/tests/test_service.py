@@ -89,7 +89,8 @@ class ServiceFlagsTestCase(test.TestCase):
         self.flags(enable_new_services=True)
         host = 'foo'
         binary = 'cinder-fake'
-        app = service.Service.create(host=host, binary=binary)
+        app = service.ServiceFactory.create(
+            host=host, binary=binary, topic='cinder-scheduler')
         app.start()
         app.stop()
         ref = db.service_get(context.get_admin_context(), app.service_id)
@@ -100,7 +101,8 @@ class ServiceFlagsTestCase(test.TestCase):
         self.flags(enable_new_services=False)
         host = 'foo'
         binary = 'cinder-fake'
-        app = service.Service.create(host=host, binary=binary)
+        app = service.ServiceFactory.create(
+            host=host, binary=binary, topic='cinder-scheduler')
         app.start()
         app.stop()
         ref = db.service_get(context.get_admin_context(), app.service_id)
@@ -122,7 +124,8 @@ class ServiceTestCase(test.TestCase):
 
         # NOTE(vish): Create was moved out of mox replay to make sure that
         #             the looping calls are created in StartService.
-        app = service.Service.create(host=host, binary=binary, topic=topic)
+        app = service.ServiceFactory.create(host=host, binary=binary,
+                                            topic=topic)
 
         self.assertTrue(app)
 
@@ -149,12 +152,13 @@ class ServiceTestCase(test.TestCase):
                                   service_create).AndReturn(service_ref)
         service.db.service_get(mox.IgnoreArg(),
                                mox.IgnoreArg()).AndRaise(Exception())
-
         self.mox.ReplayAll()
-        serv = service.Service(host,
-                               binary,
-                               topic,
-                               'cinder.tests.test_service.FakeManager')
+        serv = service.ServiceFactory.create(host,
+                                             binary,
+                                             topic,
+                                             'cinder.tests.test_service.'
+                                             'FakeManager')
+        serv.unmask_service = mock.Mock()
         serv.start()
         serv.report_state()
         self.assertTrue(serv.model_disconnected)
@@ -186,10 +190,12 @@ class ServiceTestCase(test.TestCase):
                                   mox.ContainsKeyValue('report_count', 1))
 
         self.mox.ReplayAll()
-        serv = service.Service(host,
-                               binary,
-                               topic,
-                               'cinder.tests.test_service.FakeManager')
+        serv = service.ServiceFactory.create(host,
+                                             binary,
+                                             topic,
+                                             'cinder.tests.test_service.'
+                                             'FakeManager')
+        serv.unmask_service = mock.Mock()
         serv.start()
         serv.model_disconnected = True
         serv.report_state()
@@ -199,9 +205,145 @@ class ServiceTestCase(test.TestCase):
     def test_service_with_long_report_interval(self):
         CONF.set_override('service_down_time', 10)
         CONF.set_override('report_interval', 10)
-        service.Service.create(binary="test_service",
-                               manager="cinder.tests.test_service.FakeManager")
+        service.ServiceFactory.create(
+            binary="test_service",
+            manager="cinder.tests.test_service.FakeManager")
         self.assertEqual(CONF.service_down_time, 25)
+
+
+class TestPoolManagerService(test.TestCase):
+
+    def setUp(self):
+        super(TestPoolManagerService, self).setUp()
+        self.pool_man_serv = service.ServiceFactory.create(
+            host='host@back', topic='cinder-volume')
+
+    @mock.patch('cinder.openstack.common.loopingcall.LoopingCall')
+    def test_start_pool_manager(self, loop_mock):
+        def mock_init():
+            self.pool_man_serv.initial_service.manager.driver.initialized =\
+                True
+
+        self.pool_man_serv.initial_service.manager = mock.Mock(
+            init_host=mock.Mock(wraps=mock_init),
+            driver=mock.Mock(initialized=False))
+        self.pool_man_serv.periodic_interval = 1
+        loop_mock.return_value = mock.Mock(start=mock.Mock())
+        inst = loop_mock.return_value
+        self.pool_man_serv.start()
+        self.assertTrue(
+            self.pool_man_serv.initial_service.manager.init_host.called)
+        loop_mock.assert_called_once_with(
+            self.pool_man_serv._discover_pools)
+        inst.start.assert_called_once_with(interval=1, initial_delay=None)
+
+    def test_discover_pools_not_found(self):
+        self.pool_man_serv.initial_service.driver.get_pools = mock.Mock(
+            return_value=None)
+        self.pool_man_serv._add_service = mock.Mock()
+        self.pool_man_serv._discover_pools()
+        self.pool_man_serv._add_service.assert_called_once_with(
+            service=self.pool_man_serv.initial_service)
+
+    def test_discover_pools_new(self):
+        self.pool_man_serv.initial_service.driver.get_pools = mock.Mock(
+            return_value={'pool1': {'k1': 'v1', 'k2': 'v2'}})
+        self.pool_man_serv.services.add = mock.Mock()
+        self.pool_man_serv._discover_pools()
+        self.assertEqual(self.pool_man_serv.services.add.call_count, 1)
+        self.assertEqual(len(self.pool_man_serv._service_map.items()), 1)
+        self.assertEqual(self.pool_man_serv._service_map.items()[0][0],
+                         'host@back@pool1')
+
+    def test_discover_new_pools_initial_running(self):
+        fake_serv = mock.Mock(host='host@back', mask_service=mock.Mock())
+        self.pool_man_serv._service_map[fake_serv.host] = fake_serv
+        self.pool_man_serv.initial_service.driver.get_pools = mock.Mock(
+            return_value={'p': {'k': 'v'}})
+        self.pool_man_serv._spawn_pool_services = mock.Mock()
+        self.pool_man_serv.services.remove = mock.Mock()
+        self.pool_man_serv._discover_pools()
+        self.pool_man_serv._spawn_pool_services.assert_called_once_with(
+            [('p', {'k': 'v'})])
+        self.pool_man_serv.services.remove.assert_called_once_with(fake_serv)
+        self.assertTrue(fake_serv.mask_service.called)
+
+    def test_discover_pools_new_and_dead_pools(self):
+        fake_serv_run1 = mock.Mock(host='host@back@p1')
+        fake_serv_run2 = mock.Mock(host='host@back@p2',
+                                   mask_service=mock.Mock())
+        self.pool_man_serv._service_map[fake_serv_run1.host] = fake_serv_run1
+        self.pool_man_serv._service_map[fake_serv_run2.host] = fake_serv_run2
+        self.pool_man_serv.initial_service.driver.get_pools = mock.Mock(
+            return_value={'p1': {'k': 'v'}, 'p3': {'k': 'v'}})
+        self.pool_man_serv.services.add = mock.Mock()
+        self.pool_man_serv.services.remove = mock.Mock()
+        self.pool_man_serv._discover_pools()
+        self.assertEqual(self.pool_man_serv.services.add.call_count, 1)
+        self.pool_man_serv.services.remove.assert_called_once_with(
+            fake_serv_run2)
+        self.assertTrue(fake_serv_run2.mask_service.called)
+        self.assertEqual(len(self.pool_man_serv._service_map.items()), 2)
+        self.assertTrue('host@back@p1' in self.pool_man_serv._service_map)
+        self.assertTrue('host@back@p3' in self.pool_man_serv._service_map)
+        self.assertFalse('host@back@p2' in self.pool_man_serv._service_map)
+
+    def test_stop_pool_manager(self):
+        self.pool_man_serv.services.stop_all = mock.Mock()
+        self.pool_man_serv._done.set = mock.Mock()
+        self.pool_man_serv.stop()
+        self.assertTrue(self.pool_man_serv.services.stop_all.called)
+        self.assertTrue(self.pool_man_serv._done.set.called)
+
+    def test_wait_pool_manager(self):
+        self.pool_man_serv.services.wait = mock.Mock()
+        self.pool_man_serv._done.wait = mock.Mock()
+        self.pool_man_serv.wait()
+        self.assertTrue(self.pool_man_serv.services.wait.called)
+        self.assertTrue(self.pool_man_serv._done.wait.called)
+
+    def test_reset_pool_manager(self):
+        self.pool_man_serv.services.restart = mock.Mock()
+        curr_done = self.pool_man_serv._done
+        self.pool_man_serv.reset()
+        self.assertTrue(self.pool_man_serv.services.restart.called)
+        self.assertNotEqual(curr_done, self.pool_man_serv._done)
+
+
+class TestServices(test.TestCase):
+
+    def setUp(self):
+        super(TestServices, self).setUp()
+        self.services = service.Services()
+
+    def test_stop_service(self):
+        service = mock.Mock(stop=mock.Mock(), wait=mock.Mock())
+        self.services.stop(service)
+        self.assertTrue(service.stop.called)
+        self.assertTrue(service.wait.called)
+
+    def test_stop_all_services(self):
+        self.services.services = ['serv1', 'serv2']
+        self.services.stop = mock.Mock()
+        self.services.done.set = mock.Mock()
+        self.services.tg.stop = mock.Mock()
+        self.services.stop_all()
+        self.assertEqual(self.services.stop.call_count, 2)
+        self.services.stop.assert_any_call('serv1')
+        self.services.stop.assert_any_call('serv2')
+        self.assertTrue(self.services.done.set.called)
+        self.assertTrue(self.services.tg.stop.called)
+
+    def test_remove_service(self):
+        self.services.services = ['serv']
+        self.services.stop = mock.Mock()
+        self.services.remove('serv')
+        self.services.stop.assert_called_once_with('serv')
+
+    def test_run_service(self):
+        serv = mock.Mock(start=mock.Mock())
+        self.services.run_service(serv)
+        self.assertTrue(serv.start.called)
 
 
 class TestWSGIService(test.TestCase):

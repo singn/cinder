@@ -154,7 +154,7 @@ class VolumeManager(manager.SchedulerDependentManager):
 
     target = messaging.Target(version=RPC_API_VERSION)
 
-    def __init__(self, volume_driver=None, service_name=None,
+    def __init__(self, volume_driver=None, service_name=None, extra_config=None,
                  *args, **kwargs):
         """Load the driver from the one specified in args, or from flags."""
         # update_service_capabilities needs service_name to be volume
@@ -177,7 +177,8 @@ class VolumeManager(manager.SchedulerDependentManager):
             volume_driver,
             configuration=self.configuration,
             db=self.db,
-            host=self.host)
+            host=self.host,
+            extra_config=extra_config)
 
         self.zonemanager = None
         try:
@@ -276,8 +277,20 @@ class VolumeManager(manager.SchedulerDependentManager):
                     # By default, delete volumes sequentially
                     self.delete_volume(ctxt, volume['id'])
 
-        # collect and publish service capabilities
-        self.publish_service_capabilities(ctxt)
+    def update_host_volumes(self):
+        """Update volumes for the host for pools."""
+        ctxt = context.get_admin_context()
+        volumes = self.db.volume_get_all_by_host(ctxt, self.host)
+        for volume in volumes:
+            # Get the new pool for the volume
+            pool = self.driver.get_pools(volume)
+            if pool:
+                vol_host = '%s@%s' (self.host, pool.items()[0][0])
+                if vol_host != volume['host']:
+                    LOG.debug(_('Updating volume %(vol)s host to %(host)s')
+                              % {'vol': volume['id'], 'host': vol_host})
+                    self.db.volume_update(ctxt, volume['id'],
+                                          {'host': vol_host})
 
     def create_volume(self, context, volume_id, request_spec=None,
                       filter_properties=None, allow_reschedule=True,

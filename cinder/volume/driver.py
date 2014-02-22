@@ -613,6 +613,18 @@ class VolumeDriver(object):
         """
         pass
 
+    def get_pools(self, volume=None):
+        """Gets storage pools assosiated with the backend.
+
+        It is a handle to dynamically get storage pools supported
+        by the backend. If volume is supplied then the storage pool
+        hosting the volume is returned. Storage pools returned will
+        be list of dictionaries with key as unique storage pool name
+        and value as the pool configuration which is understood by
+        the backend.
+        """
+        return None
+
 
 class ISCSIDriver(VolumeDriver):
     """Executes commands relating to ISCSI volumes.
