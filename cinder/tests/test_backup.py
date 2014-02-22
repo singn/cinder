@@ -1,4 +1,5 @@
 # Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (C) 2014 Navneet Singh.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -591,3 +592,54 @@ class BackupTestCase(test.TestCase):
             self.assertTrue(_mock_record_verify.called)
         backup = db.backup_get(self.ctxt, imported_record)
         self.assertEqual(backup['status'], 'error')
+
+    def test_get_manager_with_pool(self):
+        def create(back, pool):
+            self.backup_mgr.volume_managers['iscsi@pool'] = mock.Mock(
+                driver='fake')
+
+        fake_backend = "iscsi@pool"
+        self.backup_mgr.volume_managers['iscsi'] = mock.Mock(
+            driver=mock.Mock())
+        self.backup_mgr.volume_managers['iscsi'].driver.get_pools = \
+            mock.Mock(return_value={'pool': {'name': 'fake'}})
+        self.backup_mgr._create_vol_backend_manager = mock.Mock(wraps=create)
+        self.backup_mgr._init_volume_driver = mock.Mock()
+        mgr = self.backup_mgr._get_manager(fake_backend)
+        self.assertTrue(
+            self.backup_mgr.volume_managers['iscsi'].driver.get_pools.called)
+        self.assertTrue(self.backup_mgr._create_vol_backend_manager.called)
+        self.assertTrue(self.backup_mgr._init_volume_driver.called)
+        self.assertIsNotNone(mgr)
+
+    def test_get_manager_pool_not_found(self):
+        fake_backend = "iscsi@pool"
+        self.backup_mgr.volume_managers['iscsi'] = mock.Mock(
+            driver=mock.Mock())
+        self.backup_mgr.volume_managers['iscsi'].driver.get_pools = \
+            mock.Mock(return_value={'nopool': {'name': 'fake'}})
+        self.backup_mgr._create_vol_backend_manager = mock.Mock()
+        self.backup_mgr._init_volume_driver = mock.Mock()
+        self.assertRaises(exception.NotFound,
+                          self.backup_mgr._get_manager,
+                          fake_backend)
+        self.assertTrue(
+            self.backup_mgr.volume_managers['iscsi'].driver.get_pools.called)
+        self.assertFalse(self.backup_mgr._create_vol_backend_manager.called)
+        self.assertFalse(self.backup_mgr._init_volume_driver.called)
+
+    def test_get_manager_backend_no_pools(self):
+        fake_backend = "iscsi"
+        self.backup_mgr.volume_managers['n_iscsi'] = mock.Mock(
+            driver=mock.Mock())
+        self.backup_mgr.volume_managers['n_iscsi'].driver.get_pools = \
+            mock.Mock()
+        self.backup_mgr._create_vol_backend_manager = mock.Mock()
+        self.backup_mgr._init_volume_driver = mock.Mock()
+        self.assertRaises(exception.BackupFailedToGetVolumeBackend,
+                          self.backup_mgr._get_manager,
+                          fake_backend)
+        self.assertFalse(
+            self.backup_mgr.volume_managers['n_iscsi'].driver.get_pools.called)
+        self.assertFalse(self.backup_mgr._create_vol_backend_manager.called)
+        self.assertFalse(self.backup_mgr._init_volume_driver.called)

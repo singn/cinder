@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
+# Copyright (C) 2014 Navneet Singh.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -66,10 +67,10 @@ if __name__ == '__main__':
             CONF.register_opts([host_opt], group=backend)
             backend_host = getattr(CONF, backend).host
             host = "%s@%s" % (backend_host or CONF.host, backend)
-            server = service.Service.create(host=host,
-                                            service_name=backend)
+            server = service.ServiceFactory.create(host=host,
+                                                   service_name=backend)
             launcher.launch_service(server)
     else:
-        server = service.Service.create(binary='cinder-volume')
+        server = service.ServiceFactory.create(binary='cinder-volume')
         launcher.launch_service(server)
     launcher.wait()

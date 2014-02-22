@@ -1,6 +1,7 @@
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
+# Copyright (C) 2014 Navneet Singh.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,6 +22,8 @@
 import inspect
 import os
 import random
+import threading
+import time
 
 from oslo.config import cfg
 from oslo import messaging
@@ -33,6 +36,7 @@ from cinder.openstack.common import log as logging
 from cinder.openstack.common import loopingcall
 from cinder.openstack.common import service
 from cinder import rpc
+from cinder import utils
 from cinder import version
 from cinder import wsgi
 
@@ -71,6 +75,8 @@ class Service(service.Service):
     it state to the database services table.
     """
 
+    MASK_MSG = 'service_masked'
+
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_interval=None, periodic_fuzzy_delay=None,
                  service_name=None, *args, **kwargs):
@@ -82,6 +88,7 @@ class Service(service.Service):
         self.host = host
         self.binary = binary
         self.topic = topic
+        self.subtopic = topic.rpartition('cinder-')[2]
         self.manager_class_name = manager
         manager_class = importutils.import_class(self.manager_class_name)
         self.manager = manager_class(host=self.host,
@@ -99,8 +106,13 @@ class Service(service.Service):
         LOG.audit(_('Starting %(topic)s node (version %(version_string)s)'),
                   {'topic': self.topic, 'version_string': version_string})
         self.model_disconnected = False
-        self.manager.init_host()
         ctxt = context.get_admin_context()
+        if ((self.subtopic == 'volume' and not self.manager.driver.initialized)
+                or (self.subtopic != 'volume')):
+            self.manager.init_host()
+        if self.subtopic == 'volume':
+            # collect and publish service capabilities
+            self.manager.publish_service_capabilities(ctxt)
         try:
             service_ref = db.service_get_by_args(ctxt,
                                                  self.host,
@@ -108,6 +120,7 @@ class Service(service.Service):
             self.service_id = service_ref['id']
         except exception.NotFound:
             self._create_service_ref(ctxt)
+        self.unmask_service()
 
         LOG.debug(_("Creating RPC server for service %s") % self.topic)
 
@@ -166,52 +179,6 @@ class Service(service.Service):
         manager = self.__dict__.get('manager', None)
         return getattr(manager, key)
 
-    @classmethod
-    def create(cls, host=None, binary=None, topic=None, manager=None,
-               report_interval=None, periodic_interval=None,
-               periodic_fuzzy_delay=None, service_name=None):
-        """Instantiates class and passes back application object.
-
-        :param host: defaults to CONF.host
-        :param binary: defaults to basename of executable
-        :param topic: defaults to bin_name - 'cinder-' part
-        :param manager: defaults to CONF.<topic>_manager
-        :param report_interval: defaults to CONF.report_interval
-        :param periodic_interval: defaults to CONF.periodic_interval
-        :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
-
-        """
-        if not host:
-            host = CONF.host
-        if not binary:
-            binary = os.path.basename(inspect.stack()[-1][1])
-        if not topic:
-            topic = binary
-        if not manager:
-            subtopic = topic.rpartition('cinder-')[2]
-            manager = CONF.get('%s_manager' % subtopic, None)
-        if report_interval is None:
-            report_interval = CONF.report_interval
-        if periodic_interval is None:
-            periodic_interval = CONF.periodic_interval
-        if periodic_fuzzy_delay is None:
-            periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
-        service_obj = cls(host, binary, topic, manager,
-                          report_interval=report_interval,
-                          periodic_interval=periodic_interval,
-                          periodic_fuzzy_delay=periodic_fuzzy_delay,
-                          service_name=service_name)
-
-        return service_obj
-
-    def kill(self):
-        """Destroy the service object in the datastore."""
-        self.stop()
-        try:
-            db.service_destroy(context.get_admin_context(), self.service_id)
-        except exception.NotFound:
-            LOG.warn(_('Service killed that has no database entry'))
-
     def stop(self):
         # Try to shut the connection down, but if we get any sort of
         # errors, go ahead and ignore them.. as we're shutting down anyway
@@ -233,6 +200,43 @@ class Service(service.Service):
                 x.wait()
             except Exception:
                 pass
+
+    def kill(self):
+        """Destroy the service object in the datastore."""
+        self.stop()
+        try:
+            db.service_destroy(context.get_admin_context(), self.service_id)
+        except exception.NotFound:
+            LOG.warn(_('Service killed that has no database entry'))
+
+    def mask_service(self):
+        """Mask the service by disabling it."""
+        try:
+            service_ref = db.service_get(context.get_admin_context(),
+                                         self.service_id)
+            if service_ref.get('disabled') == 0:
+                values = {'disabled': 1, 'disabled_reason': self.MASK_MSG}
+                db.service_update(context.get_admin_context(), self.service_id,
+                                  values)
+            else:
+                LOG.debug(_('Service being masked is already masked.'))
+        except exception.NotFound:
+            LOG.warn(_('Service being masked has not database entry.'))
+
+    def unmask_service(self):
+        """Unmask the service by enabling it."""
+        try:
+            service_ref = db.service_get(context.get_admin_context(),
+                                         self.service_id)
+            if (service_ref.get('disabled') == 1 and
+                    service_ref.get('disabled_reason') == self.MASK_MSG):
+                values = {'disabled': 0, 'disabled_reason': None}
+                db.service_update(context.get_admin_context(), self.service_id,
+                                  values)
+            else:
+                LOG.debug(_('Service being unmasked is not masked.'))
+        except exception.NotFound:
+            LOG.warn(_('Service being unmasked has not database entry.'))
 
     def periodic_tasks(self, raise_on_error=False):
         """Tasks to be run at a periodic interval."""
@@ -270,6 +274,231 @@ class Service(service.Service):
             if not getattr(self, 'model_disconnected', False):
                 self.model_disconnected = True
                 LOG.exception(_('model server went away'))
+
+
+class ServiceFactory(object):
+    """Factory to create appropriate service."""
+
+    @classmethod
+    def create(cls, host=None, binary=None, topic=None, manager=None,
+               report_interval=None, periodic_interval=None,
+               periodic_fuzzy_delay=None, service_name=None,
+               extra_config=None):
+        """Instantiates class and passes back application object.
+
+        :param host: defaults to CONF.host
+        :param binary: defaults to basename of executable
+        :param topic: defaults to bin_name - 'cinder-' part
+        :param manager: defaults to CONF.<topic>_manager
+        :param report_interval: defaults to CONF.report_interval
+        :param periodic_interval: defaults to CONF.periodic_interval
+        :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
+
+        """
+        if not host:
+            host = CONF.host
+        if not binary:
+            binary = os.path.basename(inspect.stack()[-1][1])
+        if not topic:
+            topic = binary
+        subtopic = topic.rpartition('cinder-')[2]
+        if not manager:
+            manager = CONF.get('%s_manager' % subtopic, None)
+        if report_interval is None:
+            report_interval = CONF.report_interval
+        if periodic_interval is None:
+            periodic_interval = CONF.periodic_interval
+        if periodic_fuzzy_delay is None:
+            periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
+        if subtopic == 'volume':
+            service_cls = importutils.import_class(
+                'cinder.service.PoolManagerService')
+        else:
+            service_cls = importutils.import_class('cinder.service.Service')
+        service_obj = service_cls(host, binary, topic, manager,
+                                  report_interval=report_interval,
+                                  periodic_interval=periodic_interval,
+                                  periodic_fuzzy_delay=periodic_fuzzy_delay,
+                                  service_name=service_name)
+
+        return service_obj
+
+
+class PoolManagerService(service.Service):
+    """Service object for managing pool of services."""
+
+    def __init__(self, host, binary, topic, manager, report_interval=None,
+                 periodic_interval=None, periodic_fuzzy_delay=None,
+                 service_name=None):
+        super(PoolManagerService, self).__init__()
+        # Limit the pool upgrade threads to 1
+        self.tg.pool.resize(1)        
+        self.host = host
+        self.binary = binary
+        self.topic = topic
+        self.manager = manager
+        self.report_interval = report_interval
+        self.periodic_interval = periodic_interval
+        self.periodic_fuzzy_delay = periodic_fuzzy_delay
+        self.service_name = service_name
+        self.services = Services()
+        self._service_map = {}
+        self.initial_service = self._create_service()
+        # Initial upgrade run for process start
+        self.initial_upgrade_run = False
+
+    def reset(self):
+        self.services.restart()
+        self._done = threading.Event()
+
+    def start(self):
+        while not self.initial_service.driver.initialized:
+            self.initial_service.manager.init_host()
+            if not self.initial_service.driver.initialized:
+                LOG.warn(_('Driver for backend %s not initialized.'
+                           ' Retrying...'), self.initial_service.host)
+        if self.periodic_interval:
+            LOG.debug(_('Starting pool discovery as a periodic task.'))
+            pulse = loopingcall.LoopingCall(self._discover_pools)
+            pulse.start(interval=self.periodic_interval,
+                        initial_delay=None)
+
+    @utils.synchronized('service_pools')
+    def _discover_pools(self):
+        """Discover pools in backend and spawn or stop them."""
+        pools = self.initial_service.driver.get_pools() or {}
+        new_pools = []
+        dead_pools = []
+        upgrade_required = False
+        if pools:
+            # Initial service should be dead if pools are present
+            if self.host in self._service_map:
+                dead_pools.append(self._service_map[self.host])
+                upgrade_required = True
+            # Shortlist if any new pools found
+            for pool in pools.iteritems():
+                if not '%s@%s' % (self.host, pool[0]) in self._service_map:
+                    LOG.debug(_('Found pool %(p)s for backend %(b)s.')
+                              % {'p': pool[0], 'b': self.host})
+                    new_pools.append(pool)
+        else:
+            # Start the initial service if no pools found
+            if not self.host in self._service_map:
+                LOG.info(
+                    _('No pools found for backend %s.'),
+                    self.host)
+                self._add_service(service=self.initial_service)
+
+        # Shortlist pools which are dead in the latest discovery
+        for service in self._service_map:
+            try:
+                host, backend, pool = service.split('@')
+                if not pool in pools:
+                    LOG.debug(_('Dead pool %(p)s found for backend %(b)s.')
+                              % {'p': pool, 'b': self.host})
+                    dead_pools.append(self._service_map[service])
+            except ValueError:
+                continue
+        self._spawn_pool_services(new_pools)
+        self._remove_services(dead_pools)
+        # Spawn upgrade job after pool services
+        if pools and (not self.initial_upgrade_run or upgrade_required):
+            self.initial_upgrade_run = True
+            self.tg.add_thread(self.initial_service.manager.update_host_volumes)
+
+    def _create_service(self, host=None, extra_config=None):
+        """Creates new instance of the service."""
+        host = host if host else self.host
+        LOG.debug(_('Creating service with host %s.'), host)
+        service = Service(host, self.binary, self.topic, self.manager,
+                          report_interval=self.report_interval,
+                          periodic_interval=self.periodic_interval,
+                          periodic_fuzzy_delay=self.periodic_fuzzy_delay,
+                          service_name=self.service_name,
+                          extra_config=extra_config)
+        return service
+
+    def _add_service(self, service):
+        """Service init and house keeping."""
+        self._service_map[service.host] = service
+        LOG.info(_('Starting service with host %s.'), service.host)
+        self.services.add(service)
+
+    def _create_and_add_service(self, host=None, extra_config=None):
+        """Initialize and add service."""
+        service = self._create_service(host, extra_config)
+        self._add_service(service)
+
+    def _spawn_pool_services(self, pools):
+        """Creates and adds pools as services."""
+        if pools:
+            for pool in pools:
+                host = '%s@%s' % (self.host, pool[0])
+                self._create_and_add_service(host, pool[1])
+
+    def _remove_services(self, service_list):
+        """Stop and untrack services."""
+        if service_list:
+            for service in service_list:
+                LOG.debug(
+                    _('Removing service from pool manager with host %s.'),
+                    service.host)
+                # Mask the service to prevent it from getting scheduled
+                service.mask_service()
+                self.services.remove(service)
+                self._service_map.pop(service.host)
+
+    def stop(self):
+        """Stops all servies."""
+        self.services.stop_all()
+        super(PoolManagerService, self).stop()
+
+    def wait(self):
+        self.services.wait()
+        super(PoolManagerService, self).wait()
+
+
+class Services(service.Services):
+
+    MIN_WORKERS = 100
+
+    def __init__(self):
+        super(Services, self).__init__()
+        self.tg.pool.resize(self.MIN_WORKERS)
+
+    def stop(self, service):
+        # wait for graceful shutdown of service:
+        service.stop()
+        service.wait()
+
+    def stop_all(self):
+        """Stops all services."""
+        for service in self.services:
+            self.stop(service)
+        self.done.set()
+
+        # reap threads:
+        self.tg.stop()
+
+    def remove(self, service):
+        """Stop and remove the service from the list."""
+        if service in self.services:
+            self.stop(service)
+            self.services.remove(service)
+
+    def wait(self):
+        self.tg.wait()
+        self.done.wait()
+
+    @staticmethod
+    def run_service(service, *args):
+        """Service start wrapper.
+
+        :param service: service to run
+        :returns: None
+
+        """
+        service.start()
 
 
 class WSGIService(object):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
+# Copyright (C) 2014 Navneet Singh.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -54,6 +55,6 @@ if __name__ == '__main__':
          version=version.version_string())
     logging.setup("cinder")
     utils.monkey_patch()
-    server = service.Service.create(binary='cinder-scheduler')
+    server = service.ServiceFactory.create(binary='cinder-scheduler')
     service.serve(server)
     service.wait()
