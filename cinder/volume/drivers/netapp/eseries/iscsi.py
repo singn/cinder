@@ -24,6 +24,7 @@ from oslo.config import cfg
 
 from cinder import exception
 from cinder.openstack.common import excutils
+from cinder.openstack.common import lockutils
 from cinder.openstack.common import log as logging
 from cinder.volume import driver
 from cinder.volume.drivers.netapp.eseries import client
@@ -545,6 +546,7 @@ class Driver(driver.ISCSIDriver):
         raise exception.NetAppDriverException(
             msg % self._client.get_system_id())
 
+    @lockutils.synchronized('map_es_volume', 'cinder-')
     def _map_volume_to_host(self, vol, initiator):
         """Maps the e-series volume to host with initiator."""
         host = self._get_or_create_host(initiator)
